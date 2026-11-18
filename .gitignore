@@ -1,0 +1,14 @@
+# environment and outputs
+.venv/
+__pycache__/
+*.pyc
+runs/
+videos/
+submission/
+transfer/
+*.pth
+
+# not published
+demo_notes.md
+Lab4-TD3 (2026).pdf
+Lab4-Guide (2026).pdf

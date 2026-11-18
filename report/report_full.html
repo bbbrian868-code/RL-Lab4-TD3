@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>RL Lab 4 TD3 Report</title>
+<style>
+	@page { size: A4; margin: 16mm 15mm 16mm 15mm; }
+	body { font-family: "Microsoft JhengHei", "Noto Sans TC", sans-serif; font-size: 10.5pt; line-height: 1.55; color: #111; background: #fff; }
+	h1 { font-size: 18pt; margin: 0 0 4px; }
+	h2 { font-size: 13.5pt; border-bottom: 1.5px solid #333; padding-bottom: 2px; margin: 20px 0 8px; }
+	h3 { font-size: 11.5pt; margin: 14px 0 6px; }
+	.meta { color: #444; margin-bottom: 10px; }
+	table { border-collapse: collapse; width: 100%; margin: 6px 0 10px; font-size: 9.5pt; }
+	th, td { border: 1px solid #999; padding: 3px 6px; text-align: center; }
+	th { background: #eee; }
+	td.l, th.l { text-align: left; }
+	figure { margin: 8px 0 12px; text-align: center; break-inside: avoid; }
+	figure img { width: 100%; }
+	figcaption { font-size: 9pt; color: #333; margin-top: 2px; }
+	pre { background: #f4f4f4; border: 1px solid #ccc; padding: 6px 8px; font-size: 8.5pt; line-height: 1.35; white-space: pre-wrap; break-inside: avoid; }
+	code { font-family: Consolas, monospace; font-size: 9pt; }
+	.box { border-left: 3px solid #999; background: #f4f4f4; padding: 6px 10px; margin: 8px 0; }
+	ul { margin: 4px 0 8px; padding-left: 22px; }
+	li { margin: 2px 0; }
+	.pb { break-before: page; }
+	.keep, table { break-inside: avoid; }
+	h2, h3 { break-after: avoid; }
+	.b { font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>Lab 4：Twin Delayed DDPG (TD3) — CarRacing-v2</h1>
+<div class="meta">Selected Topics in Reinforcement Learning（強化學習專題）, NYCU CGI Lab — Lab 4 作業報告</div>
+
+<div class="box">
+<b>結果摘要</b>
+<ul>
+	<li><b>最終模型：</b>TD3（twin Q、target policy smoothing、policy delay 2），replay buffer 50000，煞車維度的探索 noise 縮小為 0.1 倍，訓練 320k 步。</li>
+	<li><b>測試成績：</b>60 條測試賽道（seed 0–59）平均 <b>804.8</b>，其中 53 條 ≥ 800。</li>
+	<li><b>Ablation：</b>各組設定各跑 400k 步。去掉 twin Q 的影響最大；policy delay 和探索 noise 的大小對結果也很敏感。</li>
+	<li><b>Reward：</b>在原始 reward 上加入與草地像素成比例的懲罰，20 條測試賽道的平均從 697.2 提高到 744.0。</li>
+</ul>
+</div>
+
+<h2>1. 實作說明</h2>
+<p>網路架構與影像前處理沿用 sample code：輸入為 4 張堆疊的灰階畫面，actor 輸出 steer / gas / brake 三維動作，兩個 critic 結構相同。TD3 相對於 DDPG 的三個技巧都以參數開關控制，方便做 ablation：</p>
+<table>
+	<tr><th class="l">元件</th><th class="l">實作</th><th>開關</th></tr>
+	<tr><td class="l">Twin Q（clipped double Q）</td><td class="l">y = r + γ(1 − d) · min(Q1′(s′, ã), Q2′(s′, ã))，兩個 critic 都以 MSE 對 y 回歸</td><td><code>--single_q</code></td></tr>
+	<tr><td class="l">Target policy smoothing</td><td class="l">ã = clip(μ′(s′) + clip(ε, −0.5, 0.5), a<sub>low</sub>, a<sub>high</sub>)，ε ~ N(0, 0.2²)</td><td><code>--no_target_smoothing</code></td></tr>
+	<tr><td class="l">Delayed policy update</td><td class="l">每 d 次 critic 更新，才更新一次 actor（loss = −Q1(s, μ(s))）和 target 網路</td><td><code>--policy_delay d</code></td></tr>
+	<tr><td class="l">Soft target update</td><td class="l">θ′ ← τθ + (1 − τ)θ′，τ = 0.005</td><td>—</td></tr>
+	<tr><td class="l">探索 noise</td><td class="l">a = clip(μ(s) + σ·N(0, 1))，σ 隨 episode 數線性衰減（實際上幾乎維持在初始值）</td><td><code>--expl_noise σ</code></td></tr>
+</table>
+<p>超參數依講義設定：buffer 5000、batch 32、warmup 1000、Adam、learning rate 4.5e-5（actor 與 critic 相同）、γ = 0.99、τ = 0.005、policy delay 2、探索 σ = 0.1。講義沒有指定 target noise，因此採用 TD3 論文的預設值（σ = 0.2，clip 0.5）。</p>
+<p>其他實作細節：</p>
+<ul>
+	<li><b>Reward：</b>沿用 sample code，訓練用的 reward 除以 10。</li>
+	<li><b>Episode 結束：</b>提早結束的 episode 當作 truncation 處理；時間上限造成的 truncation 不視為 terminal。</li>
+	<li><b>助教的離開賽道規則：</b>訓練時保留 sample code 的規則（道路像素 &lt; 10 時 reward = −100 並結束 episode），測試時不使用。</li>
+	<li><b>評估：</b>訓練中每 20k 步跑 3 場評估（不加 noise），並每次都儲存 checkpoint。</li>
+</ul>
+
+<h2>2. Experimental Results</h2>
+<div class="keep"><h3>2.1 Training curve（最終模型）</h3>
+<figure>
+	<img src="figures/fig_final.png">
+	<figcaption>圖 1：最終模型的 TensorBoard 曲線。左：訓練時每個 episode 的原始 reward（淺色為原始值，深色為 EMA 平滑）；右：每 20k 步評估 3 場的平均。最後選用 320k 步的 checkpoint。</figcaption>
+</figure></div>
+<p>評估曲線起伏很大，相鄰兩次評估可以差到 400 分以上，因為 3 場 episode 的樣本太少，而且偶爾一場翻車就會大幅拉低平均。因此不直接採用訓練中分數最高的 checkpoint，而是先用 <code>test.py</code> 在 seed 0–19 上初選，再用沒參與挑選的 seed 20–59 確認，最後選出 320k 步的模型。</p>
+
+<div class="keep"><h3>2.2 Testing results</h3>
+<p>使用 <code>test.py</code> 測試最終模型，前 10 場（seed 0–9，Episode 1 對應 seed 0）的輸出如下：</p>
+<pre>$ python test.py --checkpoint model_320000_825.pth --seeds 0 1 2 3 4 5 6 7 8 9
+==============================================
+Evaluating...
+Episode: 1	Length: 999	Total reward: 834.17
+Episode: 2	Length: 999	Total reward: 845.45
+Episode: 3	Length: 583	Total reward: 149.16
+Episode: 4	Length: 999	Total reward: 859.41
+Episode: 5	Length: 999	Total reward: 841.82
+Episode: 6	Length: 999	Total reward: 842.25
+Episode: 7	Length: 999	Total reward: 811.97
+Episode: 8	Length: 999	Total reward: 664.89
+Episode: 9	Length: 999	Total reward: 848.21
+Episode: 10	Length: 999	Total reward: 864.91
+average score: 756.2245092188193
+==============================================</pre>
+<figure>
+	<img src="figures/fig_test60.png">
+	<figcaption>圖 2：最終模型在 60 條測試賽道（seed 0–59）上的分數。藍色 ≥ 800，橘色 600–799，紅色 &lt; 600。</figcaption>
+</figure>
+<p>在 60 條賽道中有 53 條 ≥ 800，平均 804.8。以分數最低的 seed 2 為例，錄影顯示車在急彎打滑衝出賽道之後就回不來（見第 5 節）。</p>
+
+<h2>3. Experimental Results and Discussion</h2>
+<p>以下比較都用 seed 0，每組各訓練 400k 步（baseline A 實際跑了 1M 步，圖中截到 400k 步）。除了被比較的元件之外，其餘設定與 baseline 相同。下表彙整所有設定：</p>
+<table>
+	<tr><th>Run</th><th class="l">設定</th><th>最高評估分數（步數）</th><th>200k–400k 平均評估</th><th>300k–400k 平均訓練 reward</th></tr>
+	<tr><td>A</td><td class="l">baseline（twin Q、smoothing、delay 2、σ = 0.1）</td><td>716（260k）</td><td>300</td><td>409</td></tr>
+	<tr><td>B</td><td class="l">single Q</td><td>362（140k）</td><td>150</td><td>306</td></tr>
+	<tr><td>C</td><td class="l">無 target policy smoothing</td><td>672（200k）</td><td>204</td><td>436</td></tr>
+	<tr><td>D</td><td class="l">policy delay 1</td><td>765（380k）</td><td>365</td><td>395</td></tr>
+	<tr><td>E</td><td class="l">policy delay 4</td><td>481（40k）</td><td>111</td><td>372</td></tr>
+	<tr><td>F</td><td class="l">探索 σ = 0.3</td><td>353（40k）</td><td>37</td><td>632</td></tr>
+	<tr><td>G</td><td class="l">探索 σ = 0.03</td><td>400（60k）</td><td>176</td><td>376</td></tr>
+	<tr><td>H</td><td class="l">自訂 reward 第一版（草地懲罰 + 早停 + clip）</td><td>367（160k）</td><td>132</td><td>367</td></tr>
+	<tr><td>I</td><td class="l">自訂 reward 最終版（原始 reward + 草地懲罰）</td><td>762（200k）</td><td>301</td><td>415</td></tr>
+</table>
+<p><b>關於可信度：</b>每組設定只有一個 seed。第 4.2 節顯示，同一組設定換 seed 後結果的差距也很大，所以以下的比較應視為觀察到的趨勢，而不是定論。</p>
+
+<h3>3.1 Impact of Twin Q-Networks</h3>
+<figure><img src="figures/fig_twinq.png"><figcaption>圖 3：twin Q（A）與 single Q（B）的比較。</figcaption></figure></div>
+<p><b>結果：</b>只用單一 Q 網路（B）時，不論訓練 reward 或評估分數，大部分時間都低於 baseline。最高評估分數只有 362（A 為 716），200k–400k 的平均評估是 150（A 為 300），是所有設定中退步最明顯的一項。</p>
+<p><b>解釋：</b></p>
+<ul>
+	<li><b>高估偏差：</b>actor 的目標是最大化 Q1(s, μ(s))，等於持續在 critic 的誤差裡挑估得最高的動作。只有一個 Q 時，target y = r + γQ′(s′, μ′(s′)) 會把這種高估一路 bootstrap 傳下去，使 Q 值系統性地偏高。</li>
+	<li><b>對 actor 的影響：</b>actor 會被引導到「Q 估得高、實際表現不好」的動作。在 CarRacing 裡，表現就是在彎道過快衝出賽道，所以訓練 reward 停在約 300。</li>
+	<li><b>Twin Q 的作用：</b>取兩個獨立 critic 的較小值當 target，等於給 target 一個偏保守的估計，抵銷了 actor 主動挑高估動作造成的偏差。學習因此更穩定，可以持續進步。</li>
+</ul>
+<p>本次實作沒有把 Q 值記錄到 TensorBoard，所以無法直接畫出高估的程度；以上推論來自 reward 曲線。</p>
+
+<div class="keep"><h3>3.2 Target Policy Smoothing</h3>
+<figure><img src="figures/fig_smoothing.png"><figcaption>圖 4：開啟（A）與關閉（C）target policy smoothing 的比較。</figcaption></figure></div>
+<p><b>結果：</b>關掉 smoothing（C）後，訓練 reward 和 baseline 差不多（300k–400k 平均 436 對 409）。評估分數在前期偶爾比 A 高（約 100k 和 200k 步各有一次高點，最高 672），但 200k 步之後一直停在 200–250，沒有出現 A 在 260k 步的高峰（716）。200k–400k 平均評估是 204 對 300。表現有下降，但幅度比拿掉 twin Q 小得多，而且只有一個 seed，這個差距還在雜訊範圍內，不能算是明確的結論。</p>
+<p><b>解釋：</b></p>
+<ul>
+	<li><b>沒有 smoothing 時：</b>target 只看 μ′(s′) 這一個點的 Q 值。critic 若在某個動作附近出現尖峰，deterministic policy 會直接利用這個尖峰，target 也就跟著不準。</li>
+	<li><b>加入 smoothing 後：</b>在 target action 加上被 clip 的小 noise，等於要求相近的動作有相近的 Q 值，對 Q 函數做局部平滑，降低 target 的變異。</li>
+	<li><b>為什麼影響比 twin Q 小：</b>CarRacing 的動作空間只有三維，而且會被 clip 在範圍內，Q 函數出現尖峰的空間有限。</li>
+	<li><b>為什麼差異主要出現在評估：</b>評估時不加探索 noise，策略需要在 deterministic 的情況下也穩定；smoothing 讓 critic 對動作的微小變化比較不敏感，學到的策略比較不容易因為小偏差就失控。</li>
+</ul>
+
+<div class="keep"><h3>3.3 Delayed Policy Update Mechanism</h3>
+<figure><img src="figures/fig_delay.png"><figcaption>圖 5：policy delay 1（D）、2（A）、4（E）的比較。</figcaption></figure></div>
+<p><b>結果：</b>在 buffer = 5000 的設定下，delay 1 &gt; delay 2 &gt; delay 4：</p>
+<ul>
+	<li><b>delay 1（D）：</b>最高評估 765、後段平均 365，是第一輪中最好的一組。</li>
+	<li><b>delay 4（E）：</b>最高評估 481，出現在第 40k 步，之後一路下滑，後段平均只有 111。</li>
+</ul>
+<p>但在第二組實驗（buffer = 50000、煞車 noise × 0.1，見第 4.1 節）中，結果反過來：delay 2（R1）後段平均 660，delay 1（R2）只有 263。</p>
+<p><b>解釋：</b></p>
+<ul>
+	<li><b>delay 的取捨：</b>delay 讓 critic 先多更新幾次、Q 值較準確之後，actor 再沿著較可靠的梯度更新。這可以減少「actor 追著一個還在變動的 Q 跑」造成的發散，代價是 actor 更新的次數變少。</li>
+	<li><b>delay 4 太慢：</b>本實驗的 learning rate 很小（4.5e-5），400k 步內 actor 只更新約 10 萬次，學得太慢。早期偶然得到的好策略也沒能持續改進。</li>
+	<li><b>buffer 小時 delay 1 較好：</b>buffer 只有 5000 筆（約 10–15 個 episode）時，資料分布隨策略快速變化，critic 本來就追不上。這時更頻繁地更新 actor 反而能更快跟上資料。</li>
+	<li><b>buffer 大時 delay 2 較好：</b>buffer 加大到 50000 之後資料比較穩定，critic 估計較準，delay 2 降低變異的好處就顯現出來。</li>
+	<li><b>結論：</b>最佳的 delay 和其他超參數（buffer 大小、learning rate）有交互作用，沒有一個絕對最好的值。</li>
+</ul>
+
+<div class="keep"><h3>3.4 Action Noise Injection</h3>
+<figure><img src="figures/fig_noise.png"><figcaption>圖 6：探索 noise σ = 0.03（G）、0.1（A）、0.3（F）的比較。</figcaption></figure></div>
+<p><b>結果：</b></p>
+<ul>
+	<li><b>σ = 0.03（G）：</b>收斂最慢。訓練 reward 前 250k 步都在 300 以下，episode 數最多（1682 個），代表車經常很快衝出賽道、episode 提早結束；評估分數一直停在 200 以下。</li>
+	<li><b>σ = 0.3（F）：</b>訓練 reward 上升最快、也最高（後段平均 632），但不加 noise 的評估幾乎完全失敗（後段平均 37）。</li>
+	<li><b>σ = 0.1（A）：</b>位於兩者之間，訓練 reward 與評估分數最一致。</li>
+</ul>
+<p><b>解釋：</b></p>
+<ul>
+	<li><b>noise 太小：</b>探索不足，replay buffer 裡的動作過度集中在目前策略附近，critic 對其他動作的 Q 估計不準，actor 很難找到更好的方向，因此收斂慢，而且容易卡在保守但很差的策略。</li>
+	<li><b>noise 太大：</b>agent 的行為主要由 noise 決定，critic 學到的其實是「策略加上大 noise」這個隨機策略的價值。gas 和 brake 會被 clip 在 [0, 1]，μ 接近邊界時，加 noise 後的平均動作會被往內推，和 μ 本身不同。</li>
+	<li><b>F 評估失敗的原因（推測）：</b>actor 學到的是「配合大 noise 才好用」的動作。拿掉 noise 後，實際動作分布和訓練時差很多，所以訓練 reward 高、評估卻失敗。這是對 F 的推測，沒有另外錄影驗證。</li>
+	<li><b>結論：</b>noise 大小同時影響收斂速度（太小時慢）和穩定性（太大時，訓練與評估表現脫節）。</li>
+</ul>
+
+<div class="keep"><h3>3.5 Reward Function Design</h3>
+<figure><img src="figures/fig_reward.png"><figcaption>圖 7：原始 reward（A）與兩版自訂 reward（H、I）的比較。左、中兩張圖都用原始 reward 計算，可以直接比較；右圖是實際用來訓練的 reward。</figcaption></figure></div>
+<p><b>最終的自訂 reward（I，<code>--reward_shaping grass</code>）：</b>保留 sample code 的設計，也就是道路像素 &lt; 10 時給 −100 並結束 episode，再額外加上一項：</p>
+<ul>
+	<li><b>離開跑道懲罰：</b>每步減去 0.5 × 車輛附近草地像素數 / 480。480 是車輛周圍裁切區域（24 × 20）的像素總數，車子越偏離賽道懲罰越大，最多每步 −0.5。</li>
+</ul>
+<p>這個 reward 以 gymnasium wrapper 實作，只在訓練時使用。評估與測試一律用原始 reward。</p>
+<table>
+	<tr><th>Run</th><th class="l">訓練用的 reward</th><th>最高評估分數（步數）</th><th>0–400k 平均評估</th><th>200k–400k 平均評估</th><th>最佳 checkpoint 在 seed 0–19 的平均（&lt;300 的條數）</th></tr>
+	<tr><td>A</td><td class="l">原始 reward</td><td>716（260k）</td><td>249</td><td>300</td><td>697.2（3）</td></tr>
+	<tr><td>H</td><td class="l">草地懲罰 + 早停 + clip 到 −1</td><td>367（160k）</td><td>152</td><td>132</td><td>418.1（6）</td></tr>
+	<tr><td><b>I</b></td><td class="l"><b>原始 reward + 草地懲罰</b></td><td><b>762（200k）</b></td><td><b>322</b></td><td><b>301</b></td><td><b>744.0（1）</b></td></tr>
+</table>
+<p><b>結果：</b>I 比原始 reward 好：</p>
+<ul>
+	<li><b>訓練過程：</b>整個訓練期間的平均評估分數從 249 提高到 322，20 次評估中 ≥ 400 分的有 6 次（A 為 3 次）。從圖 7 可以看到，I 在前 200k 步的評估分數幾乎一直高於 A，學得比較快。200k 步之後兩者的平均差不多（301 對 300）。</li>
+	<li><b>測試結果：</b>兩者都取訓練中評估最高的 checkpoint，在 20 條測試賽道上比較。I 平均 744.0，A 為 697.2；分數低於 300 的嚴重失敗只有 1 條，A 有 3 條。</li>
+</ul>
+<p><b>為什麼有效：</b></p>
+<ul>
+	<li><b>提早給出訊號：</b>原始 reward 只在車子完全衝出賽道時才給 −100，是一個稀疏而且很晚才出現的訊號；車子開始偏離時，reward 幾乎沒有變化。草地懲罰會隨偏離程度逐漸變大，在衝出賽道之前就讓 critic 學到「越靠近邊緣，價值越低」，actor 也就沿著這個梯度把車子拉回中間。</li>
+	<li><b>減少失誤：</b>結果顯示 I 衝出賽道造成的嚴重失敗比較少（seed 0–19 中 &lt;300 的只有 1 條）。I 在 400k 步內的 episode 數也比 A 少（1104 對 1149），代表平均每個 episode 比較長、比較少因離開賽道而提早結束。</li>
+	<li><b>懲罰大小適中：</b>每步最多 −0.5，比走過一格新賽道的獎勵（約 +3）小得多，所以不會蓋過「往前開」這個主要目標，agent 不會因此變得過度保守。</li>
+	<li><b>保留原本的強訊號：</b>−100 的離開賽道懲罰仍然存在，是 agent 學會不要衝出賽道最主要的訊號；草地懲罰只是在它之前多加一層提示。</li>
+</ul>
+<p><b>第一版設計（H）的失敗原因：</b>第一版除了草地懲罰，還加了「連續 100 步沒有正 reward 就 truncate」的早停，以及「每步 reward 下限 clip 到 −1」。結果比原始 reward 差很多（seed 0–19 平均 418.1）。原因有兩個：</p>
+<ul>
+	<li><b>Clip 削弱了最重要的懲罰：</b>clip 把離開賽道的 −100 變成 −1，削弱了 100 倍，衝出賽道只比普通的一步差一點點。sample code 本來就把 reward 除以 10，−100 實際只是 −10，根本不需要 clip。</li>
+	<li><b>早停改變了問題本身：</b>早停讓 episode 變短，也會在減速過彎（暫時沒有正 reward）時誤觸。</li>
+</ul>
+<p>拿掉這兩項、只留下草地懲罰之後（I），表現就超越了原始 reward。</p>
+<p><b>限制：</b>每個 reward 設定只跑了一個 seed。第 4.2 節顯示 seed 之間的差距很大，所以這個改善幅度還需要更多 seed 才能確認。</p>
+
+<h2>4. 額外實驗</h2>
+<div class="keep"><h3>4.1 加大 replay buffer 與降低煞車 noise</h3>
+<figure><img src="figures/fig_improve.png"><figcaption>圖 8：baseline（A）與三組改進設定（R1–R3）的比較，各 500k 步。</figcaption></figure></div>
+<p><b>改動的動機：</b></p>
+<ul>
+	<li><b>Buffer：</b>5000 筆的 buffer 大約只能存 10–15 個 episode，資料過度集中在最近的經驗，所以加大到 50000。</li>
+	<li><b>煞車 noise：</b>sample code 的 actor 煞車輸出被縮放到 [0, 0.03]，比 σ = 0.1 的探索 noise 小得多，煞車幾乎完全由 noise 決定，車常因隨機煞車而失速，所以只把煞車維度的 noise 乘上 0.1。</li>
+</ul>
+<table>
+	<tr><th>Run</th><th class="l">設定</th><th>最高評估分數（步數）</th><th>200k–400k 平均評估</th><th>300k–400k 平均訓練 reward</th></tr>
+	<tr><td>A</td><td class="l">delay 2、buffer 5000</td><td>716（260k）</td><td>300</td><td>409</td></tr>
+	<tr><td><b>R1</b></td><td class="l">delay 2、煞車 noise × 0.1、buffer 50000</td><td><b>841（300k）</b></td><td><b>660</b></td><td><b>620</b></td></tr>
+	<tr><td>R2</td><td class="l">delay 1、煞車 noise × 0.1、buffer 50000</td><td>737（140k）</td><td>263</td><td>488</td></tr>
+	<tr><td>R3</td><td class="l">delay 1、buffer 50000</td><td>821（180k）</td><td>316</td><td>598</td></tr>
+</table>
+<p><b>結果：</b></p>
+<ul>
+	<li>R1 的後段平均評估是 baseline 的兩倍以上，最終模型就取自 R1。</li>
+	<li>R1 同時改了 buffer 和煞車 noise，無法拆開兩者各自的貢獻。</li>
+	<li>R2 和 R3 只差在煞車 noise，兩者最好的 checkpoint 在 seed 0–19 上分數相近（791 對 788）。在 delay 1 的設定下，看不出降低煞車 noise 的效果。</li>
+	<li>R1 在 340k 步後評估分數下滑，所以最好的模型要從訓練中段挑選。</li>
+</ul>
+
+<div class="keep"><h3>4.2 隨機種子的影響</h3>
+<figure><img src="figures/fig_seeds.png"><figcaption>圖 9：R1 的設定分別用 seed 0、1、2 訓練。</figcaption></figure></div>
+<p><b>結果：</b>同一組設定換成 seed 1、2，400k 步內最高評估分數只有 687 和 598，訓練 reward 停在 400–450，沒有重現 seed 0 的表現（seed 0 在約 150k 步突破到 660 以上）。</p>
+<p><b>意義：</b></p>
+<ul>
+	<li>TD3 在這個任務上對隨機種子非常敏感，R1 的好成績有一部分來自 seed。</li>
+	<li>第 3 節每組只跑一個 seed，seed 之間的差距可能和設定之間的差距一樣大，所以第 3 節的結論只能視為趨勢。</li>
+</ul>
+
+<h3>4.3 模型挑選</h3>
+<p><b>為什麼不直接用 <code>best.pth</code>：</b>訓練中的評估只有 3 場，雜訊很大，用 <code>best.pth</code> 挑模型並不可靠。因此在每次評估時都儲存 checkpoint，再分階段挑選：</p>
+<table>
+	<tr><th>Checkpoint</th><th>seed 0–19（初選）</th><th>seed 20–39（複驗）</th><th>seed 40–59（全新）</th><th>60 條平均</th></tr>
+	<tr><td><b>R1 @ 320k</b></td><td>793.8</td><td><b>827.8</b></td><td><b>793.2</b></td><td><b>804.8</b></td></tr>
+	<tr><td>R1 @ 300k</td><td>796.8</td><td>800.0</td><td>—</td><td>—</td></tr>
+	<tr><td>R3 @ 180k</td><td>788.0</td><td>819.8</td><td>—</td><td>—</td></tr>
+	<tr><td>R1 280k–320k 權重平均</td><td>813.1</td><td>827.3</td><td>773.0</td><td>804.5</td></tr>
+	<tr><td>第一輪最佳（D，delay 1）</td><td>725</td><td>781.2</td><td>—</td><td>—</td></tr>
+</table>
+<p><b>權重平均：</b>把相鄰 checkpoint 的權重平均，在前兩組賽道上看起來比較好，但在完全沒用過的 seed 40–59 上輸給 R1 @ 320k，所以最後沒有採用。這也說明只用同一組賽道挑選模型會高估真實表現。</p>
+
+<h2>5. 失敗分析</h2>
+<p>觀察最終模型在 seed 2（149 分）以及 seed 1 那組 run 的錄影，發現兩者的失敗模式相同：</p>
+<ul>
+	<li>車在急彎或兩段賽道緊貼的地方打滑，衝出賽道。</li>
+	<li>之後完全沒有試著回到賽道，而是一直直走直到駛出地圖邊界，或在草地上原地打轉直到時間用完。</li>
+</ul>
+<p><b>原因：</b>訓練時只要道路像素少於 10，episode 就以 −100 結束，所以 replay buffer 裡幾乎沒有「離開賽道後再回去」的經驗，critic 和 actor 都沒學過這種狀態。測試時沒有這條規則，模型一離開賽道就不知道該怎麼做。</p>
+<p><b>改進方向：</b>訓練時允許短暫離開賽道，例如給懲罰但不立即結束 episode，讓模型學會回到賽道。3.5 節的草地懲罰能減少衝出賽道的次數，但無法教會模型衝出去之後怎麼回來；這是 reward 設計可以再改進的方向。</p>
+
+<h2>6. 結論</h2>
+<ul>
+	<li><b>Twin Q：</b>三個技巧中影響最大，去掉後表現明顯變差，符合「抑制 Q 值高估」的設計目的。</li>
+	<li><b>Target policy smoothing：</b>主要影響評估時的穩定性。</li>
+	<li><b>Delayed policy update：</b>最佳值和 buffer 大小有交互作用。</li>
+	<li><b>探索 noise：</b>太小收斂慢，太大會讓訓練表現與 deterministic 的評估脫節。</li>
+	<li><b>自訂 reward：</b>在原始 reward 上加入草地懲罰，能在衝出賽道之前就提供訊號，學得較快、嚴重失誤較少，20 條測試賽道平均從 697.2 提高到 744.0。第一版另外加了早停和 clip，反而削弱了 −100 的懲罰，表現變差。</li>
+	<li><b>最終模型：</b>加大 replay buffer、降低煞車 noise，並用大量測試賽道挑選 checkpoint，在 60 條賽道上平均 804.8。</li>
+</ul>
+
+<h2>附錄：重現方式</h2>
+<pre>cd src
+# baseline A（1M 步）
+..\.venv\Scripts\python.exe main.py --total_steps 1000000 --seed 0
+# B–H（各 400k 步，平行執行）
+run_all.bat 400000 0
+# 自訂 reward 最終版（I）
+..\.venv\Scripts\python.exe main.py --reward_shaping grass --total_steps 400000 --seed 0
+# 最終模型的設定（R1）
+..\.venv\Scripts\python.exe main.py --brake_noise_scale 0.1 --buffer_size 50000 --total_steps 500000 --seed 0
+# 測試
+..\.venv\Scripts\python.exe test.py --checkpoint &lt;model.pth&gt; --seeds 0 1 2 3 4 --record_video ..\videos</pre>
+<p>環境：gymnasium 0.29.1（CarRacing-v2）、torch 2.0.1+cu118、numpy 1.25.2、box2d-py 2.3.5。</p>
+
+</body>
+</html>
